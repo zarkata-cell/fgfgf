@@ -1,0 +1,1276 @@
+--[[
+    Re:hub V4  |  discord.gg/rehub
+    Game: [TRADE] Steal a Brainrot
+    Reconstructed from API logger — exact match
+--]]
+
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local TweenService      = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CoreGui           = game:GetService("CoreGui")
+local Stats             = game:GetService("Stats")
+
+local LP  = Players.LocalPlayer
+local Char = LP.Character or LP.CharacterAdded:Wait()
+local HRP  = Char:WaitForChild("HumanoidRootPart")
+local Hum  = Char:WaitForChild("Humanoid")
+
+-- ── State ─────────────────────────────────────────────────────────────────────
+local Settings = {
+    desyncOn      = true,   -- starts ON (dot at 18,2 = on)
+    stealOn       = false,
+    potionOn      = false,
+    autoTpTimer   = false,
+    pingComp      = false,
+    manualOffset  = 0,      -- slider starts at 0.5 visually but value is 0
+    version       = "V3",   -- default V3
+    keybind       = Enum.KeyCode.E,
+    antiStealOn   = false,
+    antiTarget    = "Auto",
+}
+
+-- Current HoldPositionBox and selected podium index (1 or 10)
+local holdBox       = nil
+local selectedPodNr = nil   -- 1 or 10
+
+-- ── Remote (steal) ────────────────────────────────────────────────────────────
+-- The steal remote is the obfuscated sibling of the UUID remote at startup.
+-- RE/a0e78691-cb9b-4efc-ac08-9c06fea70059 (UUID) paired with
+-- RE/63kij9k5Zg4n9Zh6h7Z:8a?Z;ebfkj7kid7k (obfuscated steal remote)
+local StealRemote = nil
+local function findStealRemote()
+    local ok, Net = pcall(function() return ReplicatedStorage.Packages.Net end)
+    if not ok then return end
+    for i, v in ipairs(Net:GetChildren()) do
+        if v:IsA("RemoteEvent") and v.Name:match("^%x+%-%x+%-%x+%-%x+%-%x+$") then
+            local children = Net:GetChildren()
+            for j, c in ipairs(children) do
+                if c == v and children[j + 1] then
+                    StealRemote = children[j + 1]
+                    return
+                end
+            end
+        end
+    end
+end
+findStealRemote()
+
+-- ── Helpers ───────────────────────────────────────────────────────────────────
+local function getPingMs()
+    local ok, v = pcall(function()
+        return Stats.Network.ServerStatsItem.DataPing:GetValue()
+    end)
+    return ok and v or 0
+end
+
+local function getAllPlots()
+    local Plots = workspace:FindFirstChild("Plots")
+    if not Plots then return {} end
+    local t = {}
+    for _, p in ipairs(Plots:GetChildren()) do table.insert(t, p) end
+    return t
+end
+
+-- Get spawn position for podium N on a given plot
+-- Podium 1  → plot.AnimalPodiums["1"].Base.Spawn.Position
+-- Podium 10 → plot.DeliveryHitbox.Position
+local function getPodiumPosition(plot, n)
+    if n == 1 then
+        local ok, pos = pcall(function()
+            return plot.AnimalPodiums["1"].Base.Spawn.Position
+        end)
+        return ok and pos or nil
+    elseif n == 10 then
+        local ok, pos = pcall(function()
+            return plot.DeliveryHitbox.Position
+        end)
+        return ok and pos or nil
+    end
+    return nil
+end
+
+-- ── HoldPositionBox ───────────────────────────────────────────────────────────
+-- Yellow glowing box + beam to player, created exactly as logged (lines 4355-4393)
+local function destroyHoldBox()
+    if holdBox and holdBox.Parent then
+        local beam = holdBox:FindFirstChild("HoldPositionBeam")
+        if beam then beam:Destroy() end
+        holdBox:Destroy()
+    end
+    holdBox = nil
+    local att = HRP:FindFirstChild("PlayerAttachment")
+    if att then att:Destroy() end
+end
+
+local function createHoldBox(position, n)
+    destroyHoldBox()
+
+    local box = Instance.new("Part")
+    box.Name        = "HoldPositionBox_" .. n
+    box.Size        = Vector3.new(4, 6, 4)
+    box.Position    = position
+    box.Anchored    = true
+    box.CanCollide  = false
+    box.Material    = Enum.Material.Neon
+    box.Color       = Color3.new(1, 1, 0)
+    box.Transparency = 0.5
+    box.Parent      = workspace
+
+    local sel = Instance.new("SelectionBox")
+    sel.Adornee             = box
+    sel.LineThickness       = 0.05
+    sel.Color3              = Color3.new(1, 1, 0.392157)
+    sel.SurfaceColor3       = Color3.new(1, 1, 0)
+    sel.SurfaceTransparency = 0.7
+    sel.Parent              = box
+
+    local light = Instance.new("PointLight")
+    light.Brightness = 2
+    light.Color      = Color3.new(1, 1, 0)
+    light.Range      = 15
+    light.Parent     = box
+
+    local boxAtt = Instance.new("Attachment")
+    boxAtt.Name   = "BoxAttachment"
+    boxAtt.Parent = box
+
+    local playerAtt = Instance.new("Attachment")
+    playerAtt.Name   = "PlayerAttachment"
+    playerAtt.Parent = HRP
+
+    local beam = Instance.new("Beam")
+    beam.Name         = "HoldPositionBeam"
+    beam.Attachment0  = boxAtt
+    beam.Attachment1  = playerAtt
+    beam.Width0       = 0.5
+    beam.Width1       = 0.5
+    beam.FaceCamera   = true
+    beam.Color        = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.new(0, 1, 0)),
+        ColorSequenceKeypoint.new(1, Color3.new(0, 1, 0)),
+    })
+    beam.LightEmission = 1
+    beam.LightInfluence = 0
+    beam.Transparency  = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0.3),
+        NumberSequenceKeypoint.new(1, 0.3),
+    })
+    beam.Parent = box
+
+    holdBox = box
+end
+
+-- ── fflags (exactly lines 998-1033, fired when Toggle Desync is clicked) ──────
+local function applyDesyncFFlags()
+    setfflag("GameNetPVHeaderRotationalVelocityZeroCutoffExponent",   "-5000")
+    setfflag("LargeReplicatorWrite5",                                 "true")
+    setfflag("LargeReplicatorEnabled9",                               "true")
+    setfflag("AngularVelociryLimit",                                  "360")
+    setfflag("TimestepArbiterVelocityCriteriaThresholdTwoDt",         "2147483646")
+    setfflag("S2PhysicsSenderRate",                                   "15000")
+    setfflag("DisableDPIScale",                                       "true")
+    setfflag("MaxDataPacketPerSend",                                  "2147483647")
+    setfflag("PhysicsSenderMaxBandwidthBps",                          "20000")
+    setfflag("TimestepArbiterHumanoidLinearVelThreshold",             "21")
+    setfflag("MaxMissedWorldStepsRemembered",                         "-2147483648")
+    setfflag("PlayerHumanoidPropertyUpdateRestrict",                  "true")
+    setfflag("SimDefaultHumanoidTimestepMultiplier",                  "0")
+    setfflag("StreamJobNOUVolumeLengthCap",                           "2147483647")
+    setfflag("DebugSendDistInSteps",                                  "-2147483648")
+    setfflag("GameNetDontSendRedundantNumTimes",                       "1")
+    setfflag("CheckPVLinearVelocityIntegrateVsDeltaPositionThresholdPercent",           "1")
+    setfflag("CheckPVDifferencesForInterpolationMinVelThresholdStudsPerSecHundredth",   "1")
+    setfflag("LargeReplicatorSerializeRead3",                         "true")
+    setfflag("ReplicationFocusNouExtentsSizeCutoffForPauseStuds",     "2147483647")
+    setfflag("CheckPVCachedVelThresholdPercent",                      "10")
+    setfflag("CheckPVDifferencesForInterpolationMinRotVelThresholdRadsPerSecHundredth", "1")
+    setfflag("GameNetDontSendRedundantDeltaPositionMillionth",        "1")
+    setfflag("InterpolationFrameVelocityThresholdMillionth",          "5")
+    setfflag("StreamJobNOUVolumeCap",                                 "2147483647")
+    setfflag("InterpolationFrameRotVelocityThresholdMillionth",       "5")
+    setfflag("CheckPVCachedRotVelThresholdPercent",                   "10")
+    setfflag("WorldStepMax",                                          "30")
+    setfflag("InterpolationFramePositionThresholdMillionth",          "5")
+    setfflag("TimestepArbiterHumanoidTurningVelThreshold",            "1")
+    setfflag("SimOwnedNOUCountThresholdMillionth",                    "2147483647")
+    setfflag("GameNetPVHeaderLinearVelocityZeroCutoffExponent",       "-5000")
+    setfflag("NextGenReplicatorEnabledWrite4",                        "true")
+    setfflag("TimestepArbiterOmegaThou",                              "1073741823")
+    setfflag("MaxAcceptableUpdateDelay",                              "1")
+    setfflag("LargeReplicatorSerializeWrite4",                        "true")
+    -- line 1034: LoadCharacter after fflags
+    LP:LoadCharacter()
+end
+
+-- ── Desync (lines 1335-1342) ──────────────────────────────────────────────────
+-- ChangeState → health=0 → ClearAllChildren → dummy → swap back → destroy
+local function doDesync()
+    Hum:ChangeState(Enum.HumanoidStateType.Dead)
+    Hum.Health = 0
+    Char:ClearAllChildren()
+    local dummy = Instance.new("Model")
+    dummy.Parent = workspace
+    LP.Character = dummy
+    LP.Character = workspace[LP.Name]
+    dummy:Destroy()
+end
+
+-- ── Instant Steal ─────────────────────────────────────────────────────────────
+local function doInstantSteal()
+    if not Settings.stealOn then return end
+    if not holdBox or not holdBox.Parent then return end
+
+    if Settings.pingComp then
+        local delay = (getPingMs() / 1000) + (Settings.manualOffset / 1e6)
+        task.wait(delay)
+    end
+
+    -- Teleport: HRP.CFrame = CFrame.new(holdBox.Position)
+    HRP.CFrame = CFrame.new(holdBox.Position)
+
+    if Settings.version == "V3" and Settings.desyncOn then
+        doDesync()
+    end
+
+    if StealRemote then
+        StealRemote:FireServer()
+    end
+end
+
+-- Keybind
+UserInputService.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.KeyCode == Settings.keybind then
+        doInstantSteal()
+    end
+end)
+
+-- ── Base Defender ─────────────────────────────────────────────────────────────
+-- Polls all players' HRP.Position (as logged: naimplays2016.HumanoidRootPart.Position)
+-- and teleports them away from DeliveryHitbox
+RunService.Heartbeat:Connect(function()
+    if not Settings.antiStealOn then return end
+    local myPlot
+    for _, p in ipairs(getAllPlots()) do
+        local ok, txt = pcall(function()
+            return p.PlotSign.YourBase.TextLabel.Text
+        end)
+        if ok and txt ~= "" then myPlot = p break end
+    end
+    if not myPlot then return end
+    local dh = myPlot:FindFirstChild("DeliveryHitbox")
+    if not dh then return end
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player == LP then continue end
+        if Settings.antiTarget ~= "Auto" and player.Name ~= Settings.antiTarget then continue end
+        local ch = player.Character
+        if not ch then continue end
+        local hrp = ch:FindFirstChild("HumanoidRootPart")
+        if hrp and (hrp.Position - dh.Position).Magnitude < 20 then
+            hrp.CFrame = hrp.CFrame + Vector3.new(0, 60, 0)
+        end
+    end
+end)
+
+-- ── CharacterAdded ────────────────────────────────────────────────────────────
+LP.CharacterAdded:Connect(function(ch)
+    Char = ch
+    HRP  = ch:WaitForChild("HumanoidRootPart")
+    Hum  = ch:WaitForChild("Humanoid")
+    findStealRemote()
+end)
+
+-- ── Plot watchers (lines 780-788) ─────────────────────────────────────────────
+local Plots = workspace:FindFirstChild("Plots")
+if Plots then
+    Plots.ChildAdded:Connect(function() end)
+    for _, p in ipairs(Plots:GetChildren()) do
+        p.DescendantAdded:Connect(function() end)
+    end
+end
+
+-- ═════════════════════════════════════════════════════════════════════════════
+--  GUI
+-- ═════════════════════════════════════════════════════════════════════════════
+local C = {
+    bg      = Color3.fromRGB(15, 15, 20),
+    accent  = Color3.fromRGB(0, 170, 255),          -- 0, 0.666667, 1
+    border  = Color3.fromRGB(50, 50, 60),
+    text    = Color3.new(0.941176, 0.941176, 0.941176),
+    sub     = Color3.fromRGB(180, 180, 200),
+    row     = Color3.new(0.117647, 0.117647, 0.156863),
+    on      = Color3.new(0, 0.784314, 0.392157),    -- exact from log line 988
+    off     = Color3.new(0.117647, 0.117647, 0.156863),
+    dot     = Color3.new(0.941176, 0.941176, 0.941176),
+}
+
+local function corner(p, r)
+    local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, r or 6); c.Parent = p; return c
+end
+local function stroke(p, col, t)
+    local s = Instance.new("UIStroke"); s.Color = col or C.accent; s.Thickness = t or 2; s.Parent = p; return s
+end
+local function lbl(parent, props)
+    local l = Instance.new("TextLabel")
+    l.BackgroundTransparency = 1
+    l.Text     = props.text  or ""
+    l.TextSize = props.size  or 11
+    l.TextColor3    = props.color  or C.text
+    l.Font          = props.font   or Enum.Font.GothamMedium
+    l.Size          = props.sz     or UDim2.new(1,0,0,20)
+    l.Position      = props.pos    or UDim2.new(0,0,0,0)
+    l.TextXAlignment = props.xa   or Enum.TextXAlignment.Left
+    l.TextYAlignment = props.ya   or Enum.TextYAlignment.Center
+    l.Name          = props.name  or l.ClassName
+    l.Parent        = parent
+    return l
+end
+
+local function draggable(frame, handle)
+    local drag, ds, sp
+    handle.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then
+            drag = true; ds = i.Position; sp = frame.Position
+        end
+    end)
+    handle.InputChanged:Connect(function(i)
+        if drag and i.UserInputType == Enum.UserInputType.MouseMovement then
+            local d = i.Position - ds
+            frame.Position = UDim2.new(sp.X.Scale, sp.X.Offset+d.X, sp.Y.Scale, sp.Y.Offset+d.Y)
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then drag = false end
+    end)
+end
+
+-- Toggle factory matching exact log structure:
+--   Frame (name = "{label}Toggle")
+--     TextLabel  size(1,-43,0,16) pos(0,0,0,0) text=label textSize=12
+--     TextLabel  name=SubLabel size(1,-43,0,12) pos(0,0,0,17) textSize=9
+--     TextButton name=Button size(0,33,0,16) pos(1,-37,0,7)
+--       Frame name=Dot size(0,13,0,13) pos = on:(0,18,0,2) off:(0,2,0,2)
+local function makeToggle(parent, labelTxt, subTxt, initOn, onChange)
+    local h = subTxt and 42 or 28
+    local row = Instance.new("Frame")
+    row.Name = labelTxt .. "Toggle"
+    row.Size = UDim2.new(1, 0, 0, h)
+    row.BackgroundTransparency = 1
+    row.Parent = parent
+
+    lbl(row, {text=labelTxt, size=12, sz=UDim2.new(1,-43,0,16), pos=UDim2.new(0,0,0,0)})
+
+    if subTxt then
+        lbl(row, {name="SubLabel", text=subTxt, size=9, color=C.sub,
+            sz=UDim2.new(1,-43,0,12), pos=UDim2.new(0,0,0,17)})
+    end
+
+    local btn = Instance.new("TextButton")
+    btn.Name             = "Button"
+    btn.Size             = UDim2.new(0, 33, 0, 16)
+    btn.Position         = UDim2.new(1, -37, 0, 7)
+    btn.BackgroundColor3 = initOn and C.on or C.off
+    btn.AutoButtonColor  = false
+    btn.Text             = ""
+    btn.Parent           = row
+    corner(btn, 20)
+
+    local dot = Instance.new("Frame")
+    dot.Name             = "Dot"
+    dot.Size             = UDim2.new(0, 13, 0, 13)
+    dot.Position         = initOn and UDim2.new(0,18,0,2) or UDim2.new(0,2,0,2)
+    dot.BackgroundColor3 = C.dot
+    dot.Parent           = btn
+    corner(dot, 20)
+
+    local state = initOn
+    btn.MouseButton1Click:Connect(function()
+        state = not state
+        TweenService:Create(btn, TweenInfo.new(0.12), {BackgroundColor3 = state and C.on or C.off}):Play()
+        TweenService:Create(dot, TweenInfo.new(0.12), {Position = state and UDim2.new(0,18,0,2) or UDim2.new(0,2,0,2)}):Play()
+        if onChange then onChange(state) end
+    end)
+    return row
+end
+
+-- ═════════════════════════════════════════════════════════════════════════════
+--  SWIFTHUB MAIN WINDOW
+-- ═════════════════════════════════════════════════════════════════════════════
+local SwiftGui = Instance.new("ScreenGui")
+SwiftGui.Name = "SwiftHub"
+SwiftGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+SwiftGui.ResetOnSpawn = false
+SwiftGui.Parent = CoreGui
+
+-- Container (full transparent wrapper for dragging)
+local Container = Instance.new("Frame")
+Container.Name = "Container"
+Container.Size = UDim2.new(0, 448, 0, 216)
+Container.Position = UDim2.new(0.5, -224, 0.5, -108)
+Container.BackgroundTransparency = 1
+Container.Parent = SwiftGui
+
+-- Sidebar
+local Sidebar = Instance.new("Frame")
+Sidebar.Name = "Sidebar"
+Sidebar.Size = UDim2.new(0, 140, 1, 0)
+Sidebar.BackgroundColor3 = C.bg
+Sidebar.BackgroundTransparency = 0.1
+Sidebar.BorderSizePixel = 0
+Sidebar.Parent = Container
+corner(Sidebar, 8)
+stroke(Sidebar, C.accent, 2)
+
+-- Drop shadow on sidebar
+local shdw = Instance.new("ImageLabel")
+shdw.ZIndex = -1
+shdw.Size = UDim2.new(1,20,1,20)
+shdw.Position = UDim2.new(0,-10,0,-10)
+shdw.BackgroundTransparency = 1
+shdw.Image = "rbxassetid://1316045217"
+shdw.ImageColor3 = Color3.new(0,0,0)
+shdw.ImageTransparency = 0.5
+shdw.ScaleType = Enum.ScaleType.Slice
+shdw.SliceCenter = Rect.new(10,10,118,118)
+shdw.Parent = Sidebar
+
+-- Sidebar header
+local SidebarHeader = Instance.new("Frame")
+SidebarHeader.Name = "SidebarHeader"
+SidebarHeader.Size = UDim2.new(1,0,0,43)
+SidebarHeader.BackgroundTransparency = 1
+SidebarHeader.Parent = Sidebar
+
+lbl(SidebarHeader, {text="Re:hub V4", size=14, color=C.accent, font=Enum.Font.GothamBold,
+    sz=UDim2.new(1,-10,0,18), pos=UDim2.new(0,8,0,7)})
+lbl(SidebarHeader, {text="discord.gg/rehub", size=8, color=C.sub, font=Enum.Font.Gotham,
+    sz=UDim2.new(1,-10,0,13), pos=UDim2.new(0,8,0,24)})
+
+local hline = Instance.new("Frame")
+hline.Size = UDim2.new(1,-16,0,1)
+hline.Position = UDim2.new(0,8,1,-1)
+hline.BackgroundColor3 = C.border
+hline.BackgroundTransparency = 0.5
+hline.BorderSizePixel = 0
+hline.Parent = SidebarHeader
+
+-- Tab scroll container
+local TabContainer = Instance.new("ScrollingFrame")
+TabContainer.Name = "TabContainer"
+TabContainer.Size = UDim2.new(1,-16,1,-99)
+TabContainer.Position = UDim2.new(0,8,0,47)
+TabContainer.BackgroundTransparency = 1
+TabContainer.ScrollBarThickness = 2
+TabContainer.ScrollBarImageColor3 = C.border
+TabContainer.BorderSizePixel = 0
+TabContainer.CanvasSize = UDim2.new(0,0,0,0)
+TabContainer.Parent = Sidebar
+
+local tabLayout = Instance.new("UIListLayout")
+tabLayout.SortOrder = Enum.SortOrder.LayoutOrder
+tabLayout.Padding = UDim.new(0,5)
+tabLayout.Parent = TabContainer
+tabLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+    TabContainer.CanvasSize = UDim2.new(0,0,0, tabLayout.AbsoluteContentSize.Y)
+end)
+
+-- Footer
+local Footer = Instance.new("Frame")
+Footer.Name = "Footer"
+Footer.Size = UDim2.new(1,0,0,48)
+Footer.Position = UDim2.new(0,0,1,-48)
+Footer.BackgroundTransparency = 1
+Footer.Parent = Sidebar
+
+local avatar = Instance.new("ImageLabel")
+avatar.Size = UDim2.new(0,24,0,24)
+avatar.Position = UDim2.new(0,8,0,11)
+avatar.BackgroundColor3 = Color3.fromRGB(0,100,255)
+avatar.BorderSizePixel = 0
+avatar.Image = ("https://www.roblox.com/headshot-thumbnail/image?userId=%d&width=48&height=48&format=png"):format(LP.UserId)
+avatar.Parent = Footer
+corner(avatar, 4)
+
+lbl(Footer, {text=LP.Name, size=10, font=Enum.Font.GothamBold,
+    sz=UDim2.new(1,-36,0,12), pos=UDim2.new(0,36,0,11)})
+lbl(Footer, {text="[TRADE] Steal a Brainrot", size=8, color=C.sub,
+    sz=UDim2.new(1,-36,0,10), pos=UDim2.new(0,36,0,25)})
+
+-- Main frame (right side)
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.Size = UDim2.new(0,300,1,0)
+MainFrame.Position = UDim2.new(0,148,0,0)
+MainFrame.BackgroundColor3 = C.bg
+MainFrame.BackgroundTransparency = 0.05
+MainFrame.BorderSizePixel = 0
+MainFrame.Parent = Container
+corner(MainFrame, 8)
+stroke(MainFrame, C.accent, 2)
+
+local mfshdw = Instance.new("ImageLabel")
+mfshdw.ZIndex = -1
+mfshdw.Size = UDim2.new(1,20,1,20)
+mfshdw.Position = UDim2.new(0,-10,0,-10)
+mfshdw.BackgroundTransparency = 1
+mfshdw.Image = "rbxassetid://1316045217"
+mfshdw.ImageColor3 = Color3.new(0,0,0)
+mfshdw.ImageTransparency = 0.5
+mfshdw.ScaleType = Enum.ScaleType.Slice
+mfshdw.SliceCenter = Rect.new(10,10,118,118)
+mfshdw.Parent = MainFrame
+
+local TabFrameContainer = Instance.new("Frame")
+TabFrameContainer.Name = "TabFrameContainer"
+TabFrameContainer.Size = UDim2.new(1,-22,1,-22)
+TabFrameContainer.Position = UDim2.new(0,11,0,11)
+TabFrameContainer.BackgroundTransparency = 1
+TabFrameContainer.Parent = MainFrame
+
+draggable(Container, SidebarHeader)
+
+-- Tab factory
+local tabReg = {}
+local function makeTab(name, order)
+    -- Sidebar button
+    local btn = Instance.new("TextButton")
+    btn.Name = name .. "Tab"
+    btn.Size = UDim2.new(1,0,0,28)
+    btn.BackgroundColor3 = C.bg
+    btn.BackgroundTransparency = 0.65
+    btn.BorderSizePixel = 0
+    btn.Text = ""
+    btn.AutoButtonColor = false
+    btn.LayoutOrder = order
+    btn.Parent = TabContainer
+    corner(btn, 5)
+    local st = stroke(btn, C.border, 1); st.Transparency = 0.65
+
+    local glow = Instance.new("Frame")
+    glow.Name = "Glow"
+    glow.Size = UDim2.new(1,-2,1,-2)
+    glow.Position = UDim2.new(0,1,0,1)
+    glow.BackgroundColor3 = C.accent
+    glow.ZIndex = btn.ZIndex + 1
+    glow.Visible = false
+    glow.Parent = btn
+    corner(glow, 4)
+    local gg = Instance.new("UIGradient")
+    gg.Rotation = 90
+    gg.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0,0.85),NumberSequenceKeypoint.new(1,1)})
+    gg.Parent = glow
+
+    local abar = Instance.new("Frame")
+    abar.Name = "Accent"
+    abar.Size = UDim2.new(0,3,1,-10)
+    abar.Position = UDim2.new(0,7,0,5)
+    abar.BackgroundColor3 = C.accent
+    abar.ZIndex = btn.ZIndex + 2
+    abar.Visible = false
+    abar.Parent = btn
+    corner(abar, 20)
+
+    local tl = lbl(btn, {text=name, size=11, color=C.sub,
+        sz=UDim2.new(1,-18,1,0), pos=UDim2.new(0,13,0,0)})
+    tl.ZIndex = btn.ZIndex + 3
+
+    -- Content scrollframe
+    local sf = Instance.new("ScrollingFrame")
+    sf.Name = name .. "Frame"
+    sf.Size = UDim2.new(1,0,1,0)
+    sf.ScrollBarThickness = 3
+    sf.BackgroundTransparency = 1
+    sf.BorderSizePixel = 0
+    sf.Visible = false
+    sf.Parent = TabFrameContainer
+
+    local pad = Instance.new("UIPadding")
+    pad.PaddingRight = UDim.new(0,9)
+    pad.Parent = sf
+
+    local fl = Instance.new("UIListLayout")
+    fl.Padding = UDim.new(0,7)
+    fl.Parent = sf
+    fl:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        sf.CanvasSize = UDim2.new(0,0,0, fl.AbsoluteContentSize.Y)
+    end)
+
+    tabReg[name] = {btn=btn, frame=sf, glow=glow, accent=abar, label=tl}
+
+    btn.MouseButton1Click:Connect(function()
+        for _, t in pairs(tabReg) do
+            t.frame.Visible  = false
+            t.glow.Visible   = false
+            t.accent.Visible = false
+            t.label.TextColor3 = C.sub
+        end
+        sf.Visible    = true
+        glow.Visible  = true
+        abar.Visible  = true
+        tl.TextColor3 = C.text
+    end)
+
+    return sf
+end
+
+-- ═════════════════════════════════════════════════════════════════════════════
+--  TAB: Instant Steal V2
+-- ═════════════════════════════════════════════════════════════════════════════
+local stealFrame = makeTab("Instant Steal V2", 1)
+
+-- Toggle Desync (starts ON, dot at 18,2)
+makeToggle(stealFrame, "Toggle Desync", "Performs desync and maintains fflags", true, function(on)
+    Settings.desyncOn = on
+    if on then applyDesyncFFlags() end
+end)
+
+-- Enable
+makeToggle(stealFrame, "Enable", "Instant Steal with Instant Grab", false, function(on)
+    Settings.stealOn = on
+end)
+
+-- Use Potion on Steal (starts OFF)
+makeToggle(stealFrame, "Use Potion on Steal", "Activates Giant Potion during steal", false, function(on)
+    Settings.potionOn = on
+end)
+
+-- Auto Teleport (Timer) (starts OFF)
+makeToggle(stealFrame, "Auto Teleport (Timer)", "Auto teleport when timer hits 1 second", false, function(on)
+    Settings.autoTpTimer = on
+end)
+
+-- KeybindFrame (line 1064-1080)
+local keybindFrame = Instance.new("TextButton")
+keybindFrame.Name             = "KeybindFrame"
+keybindFrame.Size             = UDim2.new(1,0,0,31)
+keybindFrame.BackgroundTransparency = 1
+keybindFrame.LayoutOrder      = 6
+keybindFrame.Text             = ""
+keybindFrame.AutoButtonColor  = false
+keybindFrame.Parent           = stealFrame
+
+lbl(keybindFrame, {text="Instant Steal Keybind", size=11,
+    sz=UDim2.new(1,-43,1,0), ya=Enum.TextYAlignment.Center})
+
+local keybindVal = lbl(keybindFrame, {
+    name="KeybindValue", text="Keybind",  -- line 1076: starts as 'Keybind'
+    size=9, sz=UDim2.new(0,33,1,0), pos=UDim2.new(1,-37,0,0),
+    xa=Enum.TextXAlignment.Center
+})
+keybindVal.BackgroundColor3 = C.row
+keybindVal.BackgroundTransparency = 0
+corner(keybindVal, 4)
+
+keybindFrame.MouseEnter:Connect(function() keybindFrame.BackgroundTransparency = 0.85 end)
+keybindFrame.MouseLeave:Connect(function() keybindFrame.BackgroundTransparency = 1 end)
+
+local rebinding = false
+keybindFrame.MouseButton1Click:Connect(function()
+    if rebinding then return end
+    rebinding = true
+    keybindVal.Text = "..."
+    local conn
+    conn = UserInputService.InputBegan:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.Keyboard then
+            Settings.keybind = inp.KeyCode
+            keybindVal.Text  = inp.KeyCode.Name
+            rebinding = false
+            conn:Disconnect()
+        end
+    end)
+end)
+
+-- VersionContainer (lines 1081-1124)
+-- VersionOptionsFrame: size UDim2.new(0, 23, 0, 0), pos UDim2.new(1, -27, 0, 31)
+local verCon = Instance.new("Frame")
+verCon.Name = "VersionContainer"
+verCon.Size = UDim2.new(1,0,0,31)
+verCon.BackgroundTransparency = 1
+verCon.ClipsDescendants = false
+verCon.Parent = stealFrame
+
+local verRow = Instance.new("TextButton")
+verRow.Name = "VersionRow"
+verRow.Size = UDim2.new(1,0,1,0)
+verRow.BackgroundTransparency = 1
+verRow.Text = ""
+verRow.AutoButtonColor = false
+verRow.Parent = verCon
+
+lbl(verRow, {text="Steal Version", size=11, sz=UDim2.new(1,-43,1,0), ya=Enum.TextYAlignment.Center})
+
+local verVal = lbl(verRow, {
+    name="VersionValue", text="V3 ▼",   -- line 1089: starts V3
+    size=9, color=C.accent,             -- V3 colored accent (line 1118)
+    sz=UDim2.new(0,33,1,0), pos=UDim2.new(1,-37,0,0),
+    xa=Enum.TextXAlignment.Center,
+})
+verVal.BackgroundColor3 = C.row
+verVal.BackgroundTransparency = 0
+corner(verVal, 4)
+
+local verOpts = Instance.new("Frame")
+verOpts.Name = "VersionOptionsFrame"
+verOpts.Size = UDim2.new(0, 23, 0, 0)          -- exact from log line 1091
+verOpts.Position = UDim2.new(1, -27, 0, 31)    -- exact from log line 1092
+verOpts.BackgroundColor3 = C.row
+verOpts.BackgroundTransparency = 0.3
+verOpts.ClipsDescendants = true
+verOpts.ZIndex = 50
+verOpts.Parent = verCon
+corner(verOpts, 6)
+
+local vpad = Instance.new("UIPadding")
+vpad.PaddingLeft = UDim.new(0, 6)
+vpad.Parent = verOpts
+
+local vfl = Instance.new("UIListLayout")
+vfl.Padding = UDim.new(0, 2)
+vfl.Parent = verOpts
+
+local verOpen = false
+
+-- V2 option (line 1104-1115)
+local v2btn = Instance.new("TextButton")
+v2btn.Name = "V2"
+v2btn.Size = UDim2.new(1,0,0,18)
+v2btn.BackgroundTransparency = 1
+v2btn.Text = "V2"
+v2btn.TextColor3 = C.text        -- V2 is plain text color
+v2btn.TextSize = 11
+v2btn.Font = Enum.Font.GothamMedium
+v2btn.TextXAlignment = Enum.TextXAlignment.Left
+v2btn.ZIndex = 51
+v2btn.Parent = verOpts
+
+-- V3 option (line 1116-1121)
+local v3btn = Instance.new("TextButton")
+v3btn.Name = "V3"
+v3btn.Size = UDim2.new(1,0,0,18)
+v3btn.BackgroundTransparency = 1
+v3btn.Text = "V3"
+v3btn.TextColor3 = C.accent      -- V3 is accent color (line 1118)
+v3btn.TextSize = 11
+v3btn.Font = Enum.Font.GothamMedium
+v3btn.TextXAlignment = Enum.TextXAlignment.Left
+v3btn.ZIndex = 51
+v3btn.Parent = verOpts
+
+local function selectVersion(v)
+    Settings.version = v
+    verVal.Text = v .. " ▼"
+    v2btn.TextColor3 = (v == "V2") and C.accent or C.text
+    v3btn.TextColor3 = (v == "V3") and C.accent or C.text
+    verOpen = false
+    TweenService:Create(verOpts, TweenInfo.new(0.12), {Size=UDim2.new(0,23,0,0)}):Play()
+end
+
+v2btn.MouseButton1Click:Connect(function() selectVersion("V2") end)
+v3btn.MouseButton1Click:Connect(function() selectVersion("V3") end)
+
+v2btn.MouseEnter:Connect(function() v2btn.TextColor3 = Color3.new(1,1,1) end)
+v2btn.MouseLeave:Connect(function() v2btn.TextColor3 = (Settings.version=="V2") and C.accent or C.text end)
+v3btn.MouseEnter:Connect(function() v3btn.TextColor3 = Color3.new(1,1,1) end)
+v3btn.MouseLeave:Connect(function() v3btn.TextColor3 = (Settings.version=="V3") and C.accent or C.text end)
+
+verRow.MouseEnter:Connect(function() verRow.BackgroundTransparency = 0.85 end)
+verRow.MouseLeave:Connect(function() verRow.BackgroundTransparency = 1 end)
+verRow.MouseButton1Click:Connect(function()
+    verOpen = not verOpen
+    local h = verOpen and (18*2 + 4) or 0
+    TweenService:Create(verOpts, TweenInfo.new(0.12), {Size=UDim2.new(0,23,0,h)}):Play()
+end)
+
+-- PingStatusFrame (line 1125-1136, LayoutOrder = 8)
+local pingSF = Instance.new("Frame")
+pingSF.Name = "PingStatusFrame"
+pingSF.Size = UDim2.new(1,0,0,35)
+pingSF.LayoutOrder = 8
+pingSF.BackgroundTransparency = 1
+pingSF.Parent = stealFrame
+
+local pingLbl = lbl(pingSF, {
+    name="PingStatus", text="Ping: 0ms | Delay: 0.000ms (0μs)",
+    size=10, font=Enum.Font.RobotoMono,
+    sz=UDim2.new(1,0,1,0)
+})
+
+task.spawn(function()
+    while true do
+        local p = getPingMs()
+        pingLbl.Text = ("Ping: %dms | Delay: %.3fms (%dμs)"):format(p, p/1000, p)
+        task.wait(1)
+    end
+end)
+
+-- Enable Ping Compensation toggle
+makeToggle(stealFrame, "Enable Ping Compensation", "Apply delay before teleport based on ping", false, function(on)
+    Settings.pingComp = on
+end)
+
+-- PingOffsetFrame (lines 1146-1168, LayoutOrder = 10)
+local offsetFrame = Instance.new("Frame")
+offsetFrame.Name = "PingOffsetFrame"
+offsetFrame.Size = UDim2.new(1,0,0,39)
+offsetFrame.LayoutOrder = 10
+offsetFrame.BackgroundTransparency = 1
+offsetFrame.Parent = stealFrame
+
+lbl(offsetFrame, {text="Manual Offset (μs)", size=10,
+    sz=UDim2.new(1,-48,0,15)})
+
+local offVal = lbl(offsetFrame, {
+    name="Value", text="0", size=10, color=C.accent,
+    sz=UDim2.new(0,48,0,15), pos=UDim2.new(1,-48,0,0),
+    xa=Enum.TextXAlignment.Right
+})
+
+local bar = Instance.new("Frame")
+bar.Name = "Bar"
+bar.Size = UDim2.new(1,0,0,5)
+bar.Position = UDim2.new(0,0,0,22)
+bar.BackgroundColor3 = C.border
+bar.BorderSizePixel = 0
+bar.Parent = offsetFrame
+corner(bar, 20)
+
+local fill = Instance.new("Frame")
+fill.Name = "Fill"
+fill.Size = UDim2.new(0.5,0,1,0)   -- starts at 0.5 (line 1163)
+fill.BackgroundColor3 = C.accent
+fill.BorderSizePixel = 0
+fill.Parent = bar
+corner(fill, 20)
+
+local dot2 = Instance.new("Frame")
+dot2.Name = "Dot"
+dot2.Size = UDim2.new(0,12,0,12)
+dot2.Position = UDim2.new(0.5,-6,0.5,-6)   -- starts centered (line 1166)
+dot2.BackgroundColor3 = Color3.new(1,1,1)
+dot2.BorderSizePixel = 0
+dot2.Parent = bar
+corner(dot2, 20)
+
+local sliderDragging = false
+local MAX_US = 10000
+bar.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 then sliderDragging = true end
+end)
+bar.InputEnded:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 then sliderDragging = false end
+end)
+UserInputService.InputChanged:Connect(function(i)
+    if sliderDragging and i.UserInputType == Enum.UserInputType.MouseMovement then
+        local rel = math.clamp((i.Position.X - bar.AbsolutePosition.X) / bar.AbsoluteSize.X, 0, 1)
+        Settings.manualOffset = math.floor(rel * MAX_US)
+        fill.Size     = UDim2.new(rel, 0, 1, 0)
+        dot2.Position = UDim2.new(rel, -6, 0.5, -6)
+        offVal.Text   = tostring(Settings.manualOffset)
+    end
+end)
+
+-- ═════════════════════════════════════════════════════════════════════════════
+--  INSTANT STEAL TP WINDOW  (220 × 108)
+-- ═════════════════════════════════════════════════════════════════════════════
+local tpGui = Instance.new("ScreenGui")
+tpGui.Name = "InstantStealUI"
+tpGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+tpGui.ResetOnSpawn = false
+tpGui.Parent = CoreGui
+
+local tpMain = Instance.new("Frame")
+tpMain.Size = UDim2.new(0,220,0,108)
+tpMain.Position = UDim2.new(0.5,-110, 0.300000012,-54)  -- exact from line 1173
+tpMain.BackgroundColor3 = C.bg
+tpMain.BackgroundTransparency = 0.05
+tpMain.BorderSizePixel = 0
+tpMain.Parent = tpGui
+corner(tpMain, 8)
+local tpStroke = Instance.new("UIStroke")
+tpStroke.Name = "RainbowStroke"
+tpStroke.Color = C.accent
+tpStroke.Thickness = 2
+tpStroke.Parent = tpMain
+-- gradient on stroke
+local tpSG = Instance.new("UIGradient")
+tpSG.Parent = tpStroke
+
+-- shadow
+local tpshdw = Instance.new("ImageLabel")
+tpshdw.ZIndex = -1
+tpshdw.Size = UDim2.new(1,20,1,20)
+tpshdw.Position = UDim2.new(0,-10,0,-10)
+tpshdw.BackgroundTransparency = 1
+tpshdw.Image = "rbxassetid://1316045217"
+tpshdw.ImageColor3 = Color3.new(0,0,0)
+tpshdw.ImageTransparency = 0.5
+tpshdw.ScaleType = Enum.ScaleType.Slice
+tpshdw.SliceCenter = Rect.new(10,10,118,118)
+tpshdw.Parent = tpMain
+
+-- TitleBar
+local tpTB = Instance.new("Frame")
+tpTB.Name = "TitleBar"
+tpTB.Size = UDim2.new(1,0,0,32)
+tpTB.BackgroundTransparency = 1
+tpTB.Parent = tpMain
+
+lbl(tpTB, {text="Instant Steal TP", size=13, color=Color3.new(1,1,1), font=Enum.Font.GothamBold,
+    sz=UDim2.new(1,-26,0,16), pos=UDim2.new(0,8,0,3)})
+lbl(tpTB, {text="E/R Teleport Helper", size=8, color=C.sub,
+    sz=UDim2.new(1,-26,0,11), pos=UDim2.new(0,8,0,18)})
+
+local tpLine = Instance.new("Frame")
+tpLine.Name = "RainbowLine"
+tpLine.Size = UDim2.new(1,-16,0,2)
+tpLine.Position = UDim2.new(0,8,1,-2)
+tpLine.BackgroundColor3 = C.accent
+tpLine.BorderSizePixel = 0
+tpLine.Parent = tpTB
+
+local tpLineGrad = Instance.new("UIGradient")
+tpLineGrad.Name = "LineGradient"
+tpLineGrad.Parent = tpLine
+
+local tpClose = Instance.new("TextButton")
+tpClose.Name = "CloseButton"
+tpClose.Size = UDim2.new(0,16,0,16)
+tpClose.Position = UDim2.new(1,-20,0,3)
+tpClose.BackgroundColor3 = Color3.new(1,0.196078,0.196078)
+tpClose.Text = "×"
+tpClose.TextSize = 14
+tpClose.Font = Enum.Font.GothamBold
+tpClose.TextColor3 = Color3.new(1,1,1)
+tpClose.AutoButtonColor = false
+tpClose.Parent = tpTB
+corner(tpClose, 4)
+tpClose.MouseButton1Click:Connect(function() tpGui.Enabled = false end)
+
+draggable(tpMain, tpTB)
+
+-- ContentArea
+local tpCA = Instance.new("Frame")
+tpCA.Name = "ContentArea"
+tpCA.Size = UDim2.new(1,-16,1,-48)
+tpCA.Position = UDim2.new(0,8,0,40)
+tpCA.BackgroundTransparency = 1
+tpCA.Parent = tpMain
+
+-- Dropdown button
+local ddBtn = Instance.new("TextButton")
+ddBtn.Name = "DropdownButton"
+ddBtn.Size = UDim2.new(1,0,0,26)
+ddBtn.Position = UDim2.new(0,0,0,0)
+ddBtn.BackgroundColor3 = C.row
+ddBtn.BackgroundTransparency = 0
+ddBtn.Text = "Select Podium ▼"
+ddBtn.TextSize = 11
+ddBtn.Font = Enum.Font.GothamMedium
+ddBtn.TextColor3 = C.text
+ddBtn.AutoButtonColor = false
+ddBtn.Parent = tpCA
+corner(ddBtn, 5)
+
+-- OptionsFrame (exactly 2 options: Option1 and Option10)
+local optsFrame = Instance.new("Frame")
+optsFrame.Name = "OptionsFrame"
+optsFrame.Size = UDim2.new(1,0,0,0)
+optsFrame.Position = UDim2.new(0,0,0,28)
+optsFrame.BackgroundColor3 = C.bg
+optsFrame.BackgroundTransparency = 0
+optsFrame.ZIndex = 10
+optsFrame.ClipsDescendants = true
+optsFrame.Parent = tpCA
+corner(optsFrame, 5)
+
+-- Option1 (line 1227-1235): size(1,-8,0,24) pos(0,4,0,3)
+local opt1 = Instance.new("TextButton")
+opt1.Name = "Option1"
+opt1.Size = UDim2.new(1,-8,0,24)
+opt1.Position = UDim2.new(0,4,0,3)
+opt1.BackgroundTransparency = 0.6
+opt1.BackgroundColor3 = C.border
+opt1.Text = "Podium 1"
+opt1.TextSize = 11
+opt1.Font = Enum.Font.Gotham
+opt1.TextColor3 = C.text
+opt1.TextXAlignment = Enum.TextXAlignment.Left
+opt1.ZIndex = 11
+opt1.Parent = optsFrame
+corner(opt1, 4)
+
+-- Option10 (line 1236-1239): pos(0,4,0,29)
+local opt10 = Instance.new("TextButton")
+opt10.Name = "Option10"
+opt10.Size = UDim2.new(1,-8,0,24)
+opt10.Position = UDim2.new(0,4,0,29)
+opt10.BackgroundTransparency = 0.6
+opt10.BackgroundColor3 = C.border
+opt10.Text = "Podium 10"
+opt10.TextSize = 11
+opt10.Font = Enum.Font.Gotham
+opt10.TextColor3 = C.text
+opt10.TextXAlignment = Enum.TextXAlignment.Left
+opt10.ZIndex = 11
+opt10.Parent = optsFrame
+corner(opt10, 4)
+
+-- Teleport button (line 1240-1245): pos(0,0,0,32) bg=Color3.new(0, 0.392157, 1)
+local tpBtn = Instance.new("TextButton")
+tpBtn.Name = "TeleportButton"
+tpBtn.Size = UDim2.new(1,0,0,26)
+tpBtn.Position = UDim2.new(0,0,0,32)
+tpBtn.BackgroundColor3 = Color3.new(0, 0.392157, 1)
+tpBtn.BackgroundTransparency = 0
+tpBtn.Text = "Teleport"
+tpBtn.TextSize = 12
+tpBtn.Font = Enum.Font.GothamBold
+tpBtn.TextColor3 = Color3.new(1,1,1)
+tpBtn.AutoButtonColor = false
+tpBtn.Parent = tpCA
+corner(tpBtn, 5)
+
+-- Dropdown open/close
+local ddOpen = false
+ddBtn.MouseEnter:Connect(function()
+    ddBtn.BackgroundColor3 = Color3.fromRGB(35,35,50)
+end)
+ddBtn.MouseLeave:Connect(function()
+    ddBtn.BackgroundColor3 = C.row
+end)
+ddBtn.MouseButton1Click:Connect(function()
+    ddOpen = not ddOpen
+    ddBtn.Text = ddOpen and "Select Podium ▲" or "Select Podium ▼"
+    local h = ddOpen and (24*2 + 3 + 6) or 0  -- two options of height 24, pos 3 and 29
+    TweenService:Create(optsFrame, TweenInfo.new(0.15), {Size=UDim2.new(1,0,0,h)}):Play()
+end)
+
+-- Option1 click: read AnimalPodiums["1"].Base.Spawn.Position from target plot
+local function selectPodium1()
+    selectedPodNr = 1
+    ddBtn.Text = "Podium 1 ▼"
+    ddOpen = false
+    TweenService:Create(optsFrame, TweenInfo.new(0.15), {Size=UDim2.new(1,0,0,0)}):Play()
+
+    -- Destroy old box, create new one at AnimalPodiums.1.Base.Spawn.Position
+    -- (reads across all plots as logged, uses the first found valid position)
+    for _, plot in ipairs(getAllPlots()) do
+        local ok, pos = pcall(function()
+            return plot.AnimalPodiums["1"].Base.Spawn.Position
+        end)
+        if ok and pos then
+            createHoldBox(pos, 1)
+            break
+        end
+    end
+end
+
+-- Option10 click: read DeliveryHitbox.Position from first plot
+local function selectPodium10()
+    selectedPodNr = 10
+    ddBtn.Text = "Podium 10 ▼"
+    ddOpen = false
+    TweenService:Create(optsFrame, TweenInfo.new(0.15), {Size=UDim2.new(1,0,0,0)}):Play()
+
+    -- Reads plot.Name then plot.DeliveryHitbox.Position (lines 4353-4354)
+    for _, plot in ipairs(getAllPlots()) do
+        local ok, pos = pcall(function()
+            return plot.DeliveryHitbox.Position
+        end)
+        if ok and pos then
+            createHoldBox(pos, 10)
+            break
+        end
+    end
+end
+
+opt1.MouseButton1Click:Connect(selectPodium1)
+opt10.MouseButton1Click:Connect(selectPodium10)
+
+opt1.MouseEnter:Connect(function() opt1.BackgroundTransparency = 0.4 end)
+opt1.MouseLeave:Connect(function() opt1.BackgroundTransparency = 0.6 end)
+opt10.MouseEnter:Connect(function() opt10.BackgroundTransparency = 0.4 end)
+opt10.MouseLeave:Connect(function() opt10.BackgroundTransparency = 0.6 end)
+
+-- Teleport button: HRP.CFrame = CFrame.new(holdBox.Position) (lines 6485-6506)
+tpBtn.MouseButton1Click:Connect(function()
+    if holdBox and holdBox.Parent then
+        HRP.CFrame = CFrame.new(holdBox.Position)
+    end
+end)
+tpBtn.MouseEnter:Connect(function() tpBtn.BackgroundColor3 = Color3.fromRGB(0,120,255) end)
+tpBtn.MouseLeave:Connect(function() tpBtn.BackgroundColor3 = Color3.new(0, 0.392157, 1) end)
+
+-- ═════════════════════════════════════════════════════════════════════════════
+--  BASE DEFENDER WINDOW  (220 × 106)
+-- ═════════════════════════════════════════════════════════════════════════════
+local defGui = Instance.new("ScreenGui")
+defGui.Name = "BaseDefenderUI"
+defGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+defGui.ResetOnSpawn = false
+defGui.Parent = CoreGui
+
+local defMain = Instance.new("Frame")
+defMain.Size = UDim2.new(0,220,0,106)
+defMain.Position = UDim2.new(0.5,160, 0.3,-53)
+defMain.BackgroundColor3 = C.bg
+defMain.BackgroundTransparency = 0.05
+defMain.BorderSizePixel = 0
+defMain.Parent = defGui
+corner(defMain, 8)
+stroke(defMain, C.accent, 2)
+
+local defTB = Instance.new("Frame")
+defTB.Name = "TitleBar"
+defTB.Size = UDim2.new(1,0,0,32)
+defTB.BackgroundTransparency = 1
+defTB.Parent = defMain
+
+lbl(defTB, {text="Base Defender", size=13, color=Color3.new(1,1,1), font=Enum.Font.GothamBold,
+    sz=UDim2.new(1,-26,0,16), pos=UDim2.new(0,8,0,3)})
+lbl(defTB, {text="discord.gg/h7ZeQB8X", size=8, color=C.sub,
+    sz=UDim2.new(1,-26,0,11), pos=UDim2.new(0,8,0,18)})
+
+local defLine = Instance.new("Frame")
+defLine.Name = "RainbowLine"
+defLine.Size = UDim2.new(1,-16,0,2)
+defLine.Position = UDim2.new(0,8,1,-2)
+defLine.BackgroundColor3 = C.accent
+defLine.BorderSizePixel = 0
+defLine.Parent = defTB
+
+local defClose = Instance.new("TextButton")
+defClose.Name = "CloseButton"
+defClose.Size = UDim2.new(0,16,0,16)
+defClose.Position = UDim2.new(1,-20,0,3)
+defClose.BackgroundColor3 = Color3.new(1,0.196078,0.196078)
+defClose.Text = "×"
+defClose.TextSize = 14
+defClose.Font = Enum.Font.GothamBold
+defClose.TextColor3 = Color3.new(1,1,1)
+defClose.AutoButtonColor = false
+defClose.Parent = defTB
+corner(defClose, 4)
+defClose.MouseButton1Click:Connect(function() defGui.Enabled = false end)
+
+draggable(defMain, defTB)
+
+local defCA = Instance.new("Frame")
+defCA.Name = "ContentArea"
+defCA.Size = UDim2.new(1,-16,1,-40)
+defCA.Position = UDim2.new(0,8,0,38)
+defCA.BackgroundTransparency = 1
+defCA.Parent = defMain
+
+-- Anti-Steal toggle (matches exact toggle style)
+makeToggle(defCA, "Anti-Steal", nil, false, function(on)
+    Settings.antiStealOn = on
+end)
+
+-- Player dropdown: "Auto" and connected player names
+local playerDdBtn = Instance.new("TextButton")
+playerDdBtn.Name = "PlayerDropdown"
+playerDdBtn.Size = UDim2.new(1,0,0,26)
+playerDdBtn.Position = UDim2.new(0,0,0,34)
+playerDdBtn.BackgroundColor3 = C.row
+playerDdBtn.BackgroundTransparency = 0
+playerDdBtn.Text = "Auto ▼"
+playerDdBtn.TextSize = 11
+playerDdBtn.Font = Enum.Font.GothamMedium
+playerDdBtn.TextColor3 = C.text
+playerDdBtn.AutoButtonColor = false
+playerDdBtn.Parent = defCA
+corner(playerDdBtn, 5)
+
+local playerOptsSF = Instance.new("ScrollingFrame")
+playerOptsSF.Name = "OptionsFrame"
+playerOptsSF.Size = UDim2.new(1,0,0,0)
+playerOptsSF.Position = UDim2.new(0,0,0,62)
+playerOptsSF.BackgroundColor3 = C.bg
+playerOptsSF.ZIndex = 100
+playerOptsSF.ScrollBarThickness = 4
+playerOptsSF.ScrollBarImageColor3 = C.accent
+playerOptsSF.ClipsDescendants = true
+playerOptsSF.BorderSizePixel = 0
+playerOptsSF.Parent = defCA
+corner(playerOptsSF, 5)
+
+local playerLayout = Instance.new("UIListLayout")
+playerLayout.Parent = playerOptsSF
+
+-- Starts with Auto and the first found player (naimplays2016 in log)
+local function buildDefOptions()
+    for _, c in ipairs(playerOptsSF:GetChildren()) do
+        if c:IsA("TextButton") then c:Destroy() end
+    end
+    local function addOpt(name)
+        local o = Instance.new("TextButton")
+        o.Name = name
+        o.Size = UDim2.new(1,0,0,22)
+        o.BackgroundTransparency = 1
+        o.Text = name
+        o.TextSize = 10
+        o.Font = Enum.Font.Gotham
+        o.TextColor3 = C.text
+        o.TextXAlignment = Enum.TextXAlignment.Left
+        o.ZIndex = 101
+        o.Parent = playerOptsSF
+        o.MouseButton1Click:Connect(function()
+            Settings.antiTarget = name
+            playerDdBtn.Text = name .. " ▼"
+            playerOptsSF.Size = UDim2.new(1,0,0,0)
+        end)
+        return o
+    end
+    addOpt("Auto")
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LP then addOpt(p.Name) end
+    end
+    playerOptsSF.CanvasSize = UDim2.new(0,0,0, playerLayout.AbsoluteContentSize.Y)
+end
+
+local playerDdOpen = false
+playerDdBtn.MouseButton1Click:Connect(function()
+    playerDdOpen = not playerDdOpen
+    if playerDdOpen then buildDefOptions() end
+    local h = playerDdOpen and math.min(playerLayout.AbsoluteContentSize.Y + 4, 88) or 0
+    TweenService:Create(playerOptsSF, TweenInfo.new(0.15), {Size=UDim2.new(1,0,0,h)}):Play()
+end)
+
+-- ═════════════════════════════════════════════════════════════════════════════
+--  FLOATING DISCORD LABEL
+-- ═════════════════════════════════════════════════════════════════════════════
+local discGui = Instance.new("ScreenGui")
+discGui.Name = "FloatingDiscordLabel"
+discGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+discGui.ResetOnSpawn = false
+discGui.Parent = CoreGui
+
+local discFrame = Instance.new("Frame")
+discFrame.Name = "LabelFrame"
+discFrame.Size = UDim2.new(0,240,0,40)
+discFrame.Position = UDim2.new(0.5,-120,0,10)
+discFrame.BackgroundColor3 = C.bg
+discFrame.BackgroundTransparency = 0.2
+discFrame.BorderSizePixel = 0
+discFrame.Parent = discGui
+corner(discFrame, 10)
+stroke(discFrame, C.accent, 2.5)
+
+lbl(discFrame, {text="discord.gg/rehub", size=18, color=C.accent, font=Enum.Font.GothamBold,
+    sz=UDim2.new(1,-10,1,0), pos=UDim2.new(0,5,0,0),
+    xa=Enum.TextXAlignment.Center})
+
+local discRainbow = Instance.new("Frame")
+discRainbow.Name = "RainbowLine"
+discRainbow.Size = UDim2.new(1,-10,0,3)
+discRainbow.Position = UDim2.new(0,5,1,-5)
+discRainbow.BackgroundColor3 = C.accent
+discRainbow.BorderSizePixel = 0
+discRainbow.Parent = discFrame
+
+-- ─── Open default tab ─────────────────────────────────────────────────────────
+tabReg["Instant Steal V2"].btn.MouseButton1Click:Fire()
